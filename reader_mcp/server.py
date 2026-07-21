@@ -17,11 +17,20 @@ mcp = FastMCP("reader-mcp")
 
 
 @mcp.tool()
-async def search_articles(query: str, limit: int = 8) -> list[dict]:
-    """Semantic search over saved articles in the personal reading library. Returns
-    the most relevant passages, each with the original `uri`, `title`, `site_name`,
-    `labels`, `date`, and a relevance `score`. Use `query` in natural language."""
-    return await index.search(query, limit=limit)
+async def search_articles(query: str, limit: int = 8, label: str | None = None,
+                          site_name: str | None = None, since: str | None = None) -> list[dict]:
+    """Semantic search over saved articles in the personal reading library. Returns the
+    most relevant passages, each with the original `uri`, `title`, `site_name`, `labels`,
+    `date`, a relevance `score`, and the `kind` of passage that matched (`body`,
+    `summary`, or a user `highlight`) plus its `section`. Use `query` in natural language.
+
+    Optional filters:
+      * `label` — scope to one label from list_labels (e.g. 'parliament').
+      * `site_name` — restrict to one source (e.g. 'The Guardian'), case-insensitive.
+      * `since` — ISO date/datetime (e.g. '2025-01-01'); keeps articles dated on/after it.
+    User highlights and summaries are given a small ranking boost."""
+    return await index.search(query, limit=limit, label=label,
+                              site_name=site_name, since=since)
 
 
 @mcp.tool()

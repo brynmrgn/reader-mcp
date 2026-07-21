@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import struct
 
@@ -34,7 +35,8 @@ def init_db() -> None:
     db.execute(
         "CREATE TABLE IF NOT EXISTS chunks ("
         "  rowid INTEGER PRIMARY KEY, bookmark_id TEXT, chunk_idx INTEGER,"
-        "  text TEXT, title TEXT, url TEXT, site_name TEXT, labels TEXT, date TEXT)"
+        "  text TEXT, kind TEXT, section TEXT,"
+        "  title TEXT, url TEXT, site_name TEXT, labels TEXT, date TEXT)"
     )
     db.execute("CREATE INDEX IF NOT EXISTS chunks_bm ON chunks(bookmark_id)")
     db.execute(
@@ -53,31 +55,144 @@ def init_db() -> None:
     db.close()
 
 
-def _migrate(db: sqlite3.Connection) -> None:
-    """One-time move to the paced-backfill scheme (schema v2).
+_SCHEMA_VERSION = 3
 
-    The previous scheme advanced the high-water cursor to the newest bookmark after a
-    *capped* pass, which froze the backfill at SYNC_MAX_PER_PASS: every later pass
-    early-broke on the first (newest) item. Seed indexed_state from whatever chunks
-    already exist (so we don't re-embed them) and drop that premature cursor so the
-    backfill resumes from where it stalled.
+
+def _migrate(db: sqlite3.Connection) -> None:
+    """Run pending schema migrations in order.
+
+    v2 — paced-backfill scheme. The old code advanced the high-water cursor to the
+    newest bookmark after a *capped* pass, freezing the backfill at SYNC_MAX_PER_PASS
+    (every later pass early-broke on the first item). Seed indexed_state from existing
+    chunks (so we don't re-embed them) and drop the premature cursor.
+
+    v3 — structure-aware chunking + summary/highlight parts. Chunk boundaries and the
+    per-chunk `kind`/`section` are new, so the old fixed-window chunks are stale: add
+    the columns and wipe the index to force a full re-embed (the paced backfill drains
+    it over the next passes).
     """
-    ver = db.execute("SELECT v FROM sync_state WHERE k='schema_version'").fetchone()
-    if ver and int(ver["v"]) >= 2:
+    row = db.execute("SELECT v FROM sync_state WHERE k='schema_version'").fetchone()
+    ver = int(row["v"]) if row else 0
+    if ver >= _SCHEMA_VERSION:
         return
-    db.execute("INSERT OR IGNORE INTO indexed_state(bookmark_id, updated) "
-               "SELECT DISTINCT bookmark_id, NULL FROM chunks")
-    db.execute("DELETE FROM sync_state WHERE k='updated_since'")
-    db.execute("INSERT OR REPLACE INTO sync_state(k, v) VALUES ('schema_version', '2')")
+    if ver < 2:
+        db.execute("INSERT OR IGNORE INTO indexed_state(bookmark_id, updated) "
+                   "SELECT DISTINCT bookmark_id, NULL FROM chunks")
+        db.execute("DELETE FROM sync_state WHERE k='updated_since'")
+    if ver < 3:
+        cols = {r[1] for r in db.execute("PRAGMA table_info(chunks)")}
+        if "kind" not in cols:
+            db.execute("ALTER TABLE chunks ADD COLUMN kind TEXT")
+        if "section" not in cols:
+            db.execute("ALTER TABLE chunks ADD COLUMN section TEXT")
+        db.execute("DELETE FROM vec_chunks")
+        db.execute("DELETE FROM chunks")
+        db.execute("DELETE FROM indexed_state")
+        db.execute("DELETE FROM sync_state WHERE k='updated_since'")
+        print("[reader-mcp] migration v3: re-indexing all bookmarks with "
+              "structure-aware chunking (summary + highlights + sections)", flush=True)
+    db.execute("INSERT OR REPLACE INTO sync_state(k, v) VALUES ('schema_version', ?)",
+               (str(_SCHEMA_VERSION),))
 
 
 def _pack(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
-def _chunk(text: str) -> list[str]:
-    step = max(1, config.CHUNK_CHARS - config.CHUNK_OVERLAP)
-    return [text[i:i + config.CHUNK_CHARS] for i in range(0, len(text), step)] or [""]
+# -- structure-aware chunking ----------------------------------------------------
+# A bookmark becomes a list of "parts", each {text, kind, section}:
+#   * summary   — the bookmark's description/abstract (one part, if present)
+#   * highlight — each user highlight/annotation (high-signal, user-curated)
+#   * body      — the article split by Markdown section, then packed by paragraph
+# `text` is stored/displayed verbatim; the section breadcrumb is prepended to the
+# EMBED input only (see _embed_input), so vectors get heading context without the
+# stored/rejoined text repeating headings.
+
+_FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.S)   # article.md YAML block
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+_PARA_SPLIT_RE = re.compile(r"\n\s*\n")
+
+
+def _strip_frontmatter(md: str) -> str:
+    return _FRONTMATTER_RE.sub("", md, count=1)
+
+
+def _split_sections(md: str) -> list[tuple[str, str]]:
+    """Split Markdown into (section_path, text) on ATX headings. section_path is the
+    breadcrumb of enclosing headings, e.g. 'Results > Cohort A'. Falls back to a single
+    ('', whole-text) section when there are no headings."""
+    sections: list[tuple[str, str]] = []
+    stack: list[tuple[int, str]] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        body = "\n".join(buf).strip()
+        if body:
+            sections.append((" > ".join(t for _, t in stack), body))
+
+    for line in md.split("\n"):
+        m = _HEADING_RE.match(line)
+        if m:
+            flush()
+            buf.clear()
+            level, title = len(m.group(1)), m.group(2).strip()
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, title))
+        else:
+            buf.append(line)
+    flush()
+    return sections or [("", md.strip())]
+
+
+def _pack_paragraphs(text: str, max_chars: int, overlap: int) -> list[str]:
+    """Greedily pack whole paragraphs into <=max_chars chunks (never splitting a
+    paragraph unless it alone exceeds the limit, in which case it's hard-split with a
+    char overlap so nothing is dropped)."""
+    chunks: list[str] = []
+    cur = ""
+    for para in (p.strip() for p in _PARA_SPLIT_RE.split(text) if p.strip()):
+        if len(para) > max_chars:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            step = max(1, max_chars - overlap)
+            chunks.extend(para[i:i + max_chars] for i in range(0, len(para), step))
+        elif cur and len(cur) + 2 + len(para) > max_chars:
+            chunks.append(cur)
+            cur = para
+        else:
+            cur = f"{cur}\n\n{para}" if cur else para
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _build_parts(bm: dict, markdown: str, highlights: list[str]) -> list[dict]:
+    """Assemble a bookmark's indexable parts: summary, highlights, then body sections."""
+    parts: list[dict] = []
+    summary = (bm.get("description") or "").strip()
+    if summary:
+        parts.append({"text": summary, "kind": "summary", "section": None})
+    for h in highlights or []:
+        h = (h or "").strip()
+        if h:
+            parts.append({"text": h, "kind": "highlight", "section": None})
+    body = _strip_frontmatter(markdown or "")
+    for section, sect_text in _split_sections(body):
+        for piece in _pack_paragraphs(sect_text, config.CHUNK_CHARS, config.CHUNK_OVERLAP):
+            parts.append({"text": piece, "kind": "body", "section": section or None})
+    if not parts:
+        parts.append({"text": (markdown or "").strip(), "kind": "body", "section": None})
+    return parts
+
+
+def _embed_input(part: dict) -> str:
+    """The string actually embedded: body chunks get their section breadcrumb prepended
+    for context; summary/highlight parts embed verbatim."""
+    if part.get("section"):
+        return f"{part['section']}\n\n{part['text']}"
+    return part["text"]
 
 
 async def _embed(texts: list[str]) -> list[list[float]]:
@@ -91,7 +206,7 @@ async def _embed(texts: list[str]) -> list[list[float]]:
 
 # -- write path (sync) -----------------------------------------------------------
 
-def _replace_bookmark(db: sqlite3.Connection, bm: dict, chunks: list[str],
+def _replace_bookmark(db: sqlite3.Connection, bm: dict, parts: list[dict],
                       vectors: list[list[float]]) -> None:
     bid = str(bm.get("id"))
     old = [r["rowid"] for r in db.execute("SELECT rowid FROM chunks WHERE bookmark_id=?", (bid,))]
@@ -99,12 +214,13 @@ def _replace_bookmark(db: sqlite3.Connection, bm: dict, chunks: list[str],
         db.execute("DELETE FROM vec_chunks WHERE rowid=?", (rid,))
     db.execute("DELETE FROM chunks WHERE bookmark_id=?", (bid,))
     labels = json.dumps(bm.get("labels") or [])
-    for idx, (text, vec) in enumerate(zip(chunks, vectors)):
+    date = bm.get("published") or bm.get("created")
+    for idx, (part, vec) in enumerate(zip(parts, vectors)):
         cur = db.execute(
-            "INSERT INTO chunks(bookmark_id, chunk_idx, text, title, url, site_name, labels, date)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (bid, idx, text, bm.get("title"), bm.get("url"), bm.get("site_name"),
-             labels, bm.get("published") or bm.get("created")),
+            "INSERT INTO chunks(bookmark_id, chunk_idx, text, kind, section,"
+            " title, url, site_name, labels, date) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (bid, idx, part["text"], part["kind"], part.get("section"),
+             bm.get("title"), bm.get("url"), bm.get("site_name"), labels, date),
         )
         db.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES (?,?)",
                    (cur.lastrowid, _pack(vec)))
@@ -150,9 +266,10 @@ async def sync_once(readeck: Readeck) -> tuple[int, bool]:
             text = await readeck.article_markdown(bid)
             if not text:
                 continue
-            chunks = _chunk(text)
-            vectors = await _embed(chunks)
-            _replace_bookmark(db, bm, chunks, vectors)
+            highlights = await readeck.annotations(bid)
+            parts = _build_parts(bm, text, highlights)
+            vectors = await _embed([_embed_input(p) for p in parts])
+            _replace_bookmark(db, bm, parts, vectors)
             db.execute("INSERT OR REPLACE INTO indexed_state(bookmark_id, updated) VALUES (?,?)",
                        (bid, upd))
             db.commit()
@@ -192,10 +309,20 @@ async def sync_loop() -> None:
 
 # -- read path (tools) -----------------------------------------------------------
 
-async def search(q: str, limit: int = 8) -> list[dict]:
-    """Semantic search: embed query, KNN over chunk vectors, collapse to distinct
-    bookmarks (best chunk wins)."""
+# User-curated / abstractive parts are stronger relevance signals than raw body text,
+# so nudge them up in the ranking (heuristic, on the 1-distance similarity proxy).
+_KIND_BOOST = {"highlight": 0.06, "summary": 0.03}
+
+
+async def search(q: str, limit: int = 8, label: str | None = None,
+                 site_name: str | None = None, since: str | None = None) -> list[dict]:
+    """Semantic search: embed query, KNN over chunk vectors, apply optional metadata
+    filters, boost highlight/summary chunks, then collapse to distinct bookmarks (best
+    chunk wins). Filters can't go inside the vec0 KNN (it needs the LIMIT directly), so
+    we over-fetch a larger candidate set and filter/rank in Python."""
     (qvec,) = await _embed([q])
+    filtered = bool(label or site_name or since)
+    k = max(limit * 25, 300) if filtered else max(limit * 4, limit)
     db = _connect()
     try:
         rows = db.execute(
@@ -203,15 +330,29 @@ async def search(q: str, limit: int = 8) -> list[dict]:
             "  SELECT rowid, distance FROM vec_chunks"
             "  WHERE embedding MATCH ? ORDER BY distance LIMIT ?"
             ")"
-            " SELECT c.bookmark_id, c.text, c.title, c.url, c.site_name, c.labels, c.date, knn.distance"
+            " SELECT c.bookmark_id, c.text, c.kind, c.section, c.title, c.url,"
+            " c.site_name, c.labels, c.date, knn.distance"
             " FROM knn JOIN chunks c ON c.rowid = knn.rowid"
             " ORDER BY knn.distance",
-            (_pack(qvec), max(limit * 4, limit)),
+            (_pack(qvec), k),
         ).fetchall()
     finally:
         db.close()
-    out, seen = [], set()
+    site_l = site_name.lower() if site_name else None
+    scored = []
     for r in rows:
+        lbls = json.loads(r["labels"] or "[]")
+        if label and label not in lbls:
+            continue
+        if site_l and (r["site_name"] or "").lower() != site_l:
+            continue
+        if since and (not r["date"] or r["date"] < since):
+            continue
+        score = (1 - r["distance"]) + _KIND_BOOST.get(r["kind"], 0.0)
+        scored.append((score, r, lbls))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    out, seen = [], set()
+    for score, r, lbls in scored:
         bid = r["bookmark_id"]
         if bid in seen:
             continue
@@ -222,9 +363,11 @@ async def search(q: str, limit: int = 8) -> list[dict]:
             "title": r["title"],
             "site_name": r["site_name"],
             "text": r["text"],
-            "labels": json.loads(r["labels"] or "[]"),
+            "kind": r["kind"],
+            "section": r["section"],
+            "labels": lbls,
             "date": r["date"],
-            "score": round(1 - r["distance"], 4),
+            "score": round(score, 4),
         })
         if len(out) >= limit:
             break
@@ -232,21 +375,27 @@ async def search(q: str, limit: int = 8) -> list[dict]:
 
 
 async def get_source(bookmark_id: str) -> dict:
-    """Full readable text (all chunks in order) + metadata for one bookmark."""
+    """Full readable text + metadata for one bookmark, with the summary and user
+    highlights surfaced separately from the body."""
     db = _connect()
     try:
         rows = db.execute(
-            "SELECT text, title, url, site_name, labels, date FROM chunks"
+            "SELECT text, kind, section, title, url, site_name, labels, date FROM chunks"
             " WHERE bookmark_id=? ORDER BY chunk_idx", (str(bookmark_id),),
         ).fetchall()
     finally:
         db.close()
     if not rows:
         return {}
+    summary = next((r["text"] for r in rows if r["kind"] == "summary"), None)
+    highlights = [r["text"] for r in rows if r["kind"] == "highlight"]
+    body = " ".join(r["text"] for r in rows if r["kind"] == "body")
     return {
         "id": str(bookmark_id),
         "uri": rows[0]["url"], "title": rows[0]["title"],
         "site_name": rows[0]["site_name"],
         "labels": json.loads(rows[0]["labels"] or "[]"), "date": rows[0]["date"],
-        "text": " ".join(r["text"] for r in rows),
+        "summary": summary,
+        "highlights": highlights,
+        "text": body or " ".join(r["text"] for r in rows),
     }

@@ -57,6 +57,35 @@ class Readeck:
             r = await self._get(client, f"/api/bookmarks/{bookmark_id}/article.md")
             return r.text
 
+    async def annotations(self, bookmark_id: str) -> list[str]:
+        """User highlights/annotations for one bookmark, as a list of text strings.
+
+        Highlights are user-curated "this matters" passages, so they're indexed as their
+        own high-signal chunks. Defensive: any non-200 (e.g. an instance without the
+        endpoint) or shape drift yields [] so the bookmark still indexes from its body.
+
+        VERIFY: endpoint path confirmed by probe against this instance
+        (`/api/bookmarks/{id}/annotations`); item text under `text`.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await self._get(client, f"/api/bookmarks/{bookmark_id}/annotations")
+                data = r.json()
+        except Exception:  # noqa: BLE001
+            return []
+        items = data.get("items") if isinstance(data, dict) else data
+        out = []
+        for it in items or []:
+            if isinstance(it, dict):
+                # Readeck returns the highlighted passage under `text`; fall back to a
+                # couple of plausible keys so a minor shape difference still captures it.
+                t = it.get("text") or it.get("quote") or it.get("content") or it.get("body")
+            else:
+                t = it
+            if t and str(t).strip():
+                out.append(str(t).strip())
+        return out
+
     async def labels(self) -> list[dict]:
         """Label taxonomy as [{name, count}].
 
