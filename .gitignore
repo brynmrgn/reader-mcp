@@ -1,0 +1,8 @@
+.venv/
+.venv2/
+data/
+*.sqlite
+__pycache__/
+*.pyc
+.env
+reader-mcp.env

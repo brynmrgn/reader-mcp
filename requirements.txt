@@ -1,0 +1,4 @@
+fastmcp>=2.10,<3
+httpx
+openai
+sqlite-vec
