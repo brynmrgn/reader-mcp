@@ -42,8 +42,33 @@ def init_db() -> None:
         f"  embedding float[{config.EMBED_DIM}])"
     )
     db.execute("CREATE TABLE IF NOT EXISTS sync_state (k TEXT PRIMARY KEY, v TEXT)")
+    # Per-bookmark index of the `updated` value we last embedded, so a paced backfill
+    # can walk newest→oldest across passes, skipping what's already current instead of
+    # re-embedding the newest N every pass. NULL = a legacy row (indexed before this
+    # table existed): treated as current so the backfill still moves forward.
+    db.execute("CREATE TABLE IF NOT EXISTS indexed_state ("
+               "  bookmark_id TEXT PRIMARY KEY, updated TEXT)")
+    _migrate(db)
     db.commit()
     db.close()
+
+
+def _migrate(db: sqlite3.Connection) -> None:
+    """One-time move to the paced-backfill scheme (schema v2).
+
+    The previous scheme advanced the high-water cursor to the newest bookmark after a
+    *capped* pass, which froze the backfill at SYNC_MAX_PER_PASS: every later pass
+    early-broke on the first (newest) item. Seed indexed_state from whatever chunks
+    already exist (so we don't re-embed them) and drop that premature cursor so the
+    backfill resumes from where it stalled.
+    """
+    ver = db.execute("SELECT v FROM sync_state WHERE k='schema_version'").fetchone()
+    if ver and int(ver["v"]) >= 2:
+        return
+    db.execute("INSERT OR IGNORE INTO indexed_state(bookmark_id, updated) "
+               "SELECT DISTINCT bookmark_id, NULL FROM chunks")
+    db.execute("DELETE FROM sync_state WHERE k='updated_since'")
+    db.execute("INSERT OR REPLACE INTO sync_state(k, v) VALUES ('schema_version', '2')")
 
 
 def _pack(vec: list[float]) -> bytes:
@@ -85,55 +110,84 @@ def _replace_bookmark(db: sqlite3.Connection, bm: dict, chunks: list[str],
                    (cur.lastrowid, _pack(vec)))
 
 
-async def sync_once(readeck: Readeck) -> int:
-    """Pull bookmarks whose `updated` is newer than our cursor, (re)embed and index.
-    Only article-bearing, loaded, non-deleted bookmarks. Paced by SYNC_MAX_PER_PASS.
-    Returns the number of bookmarks processed this pass."""
+async def sync_once(readeck: Readeck) -> tuple[int, bool]:
+    """Index up to SYNC_MAX_PER_PASS not-yet-current bookmarks, newest→oldest.
+
+    Only article-bearing, loaded, non-deleted bookmarks. Returns (processed, capped),
+    where `capped` means the pass stopped at the cap and there is more backlog to do.
+
+    Two cursors work together so the cap and incremental catch-up don't fight:
+      * `indexed_state[bid]` — the `updated` we last embedded per bookmark. A pass
+        walks newest→oldest and SKIPS anything already current, so successive capped
+        passes march down the backlog instead of re-embedding the newest N each time.
+      * `updated_since` — a high-water mark, advanced ONLY after a non-capped pass
+        (i.e. the whole backlog above it is indexed). Then later passes can early-break
+        once they reach items at/older than it. It stays unset while backfilling.
+    """
     db = _connect()
     row = db.execute("SELECT v FROM sync_state WHERE k='updated_since'").fetchone()
     since = row["v"] if row else None
-    processed, newest = 0, since
+    indexed = dict(db.execute("SELECT bookmark_id, updated FROM indexed_state").fetchall())
+    processed = skipped = scanned = 0
+    newest, capped = since, False
     try:
         async for bm in readeck.bookmarks():
+            scanned += 1
             upd = bm.get("updated")
-            # Listing is newest-updated first; once we reach items at/older than the
-            # cursor, everything after is already indexed -> stop early.
+            if upd and (newest is None or upd > newest):
+                newest = upd
+            # Steady state: a cursor exists only after a non-capped pass, so everything
+            # at/older than it is fully indexed -> stop (listing is newest-first).
             if since and upd and upd <= since:
                 break
             if not (bm.get("state") == 0 and bm.get("has_article") and not bm.get("is_deleted")):
                 continue
-            text = await readeck.article_markdown(str(bm.get("id")))
+            bid = str(bm.get("id"))
+            # Already current? (NULL = legacy row, treat as current so backfill advances.)
+            if bid in indexed and (indexed[bid] is None or indexed[bid] == upd):
+                skipped += 1
+                continue
+            text = await readeck.article_markdown(bid)
             if not text:
                 continue
             chunks = _chunk(text)
             vectors = await _embed(chunks)
             _replace_bookmark(db, bm, chunks, vectors)
+            db.execute("INSERT OR REPLACE INTO indexed_state(bookmark_id, updated) VALUES (?,?)",
+                       (bid, upd))
             db.commit()
+            indexed[bid] = upd
             processed += 1
-            if upd and (newest is None or upd > newest):
-                newest = upd
             if config.SYNC_MAX_PER_PASS and processed >= config.SYNC_MAX_PER_PASS:
+                capped = True
                 break
-        if newest and newest != since:
+        # Only claim the high-water mark once a pass finished WITHOUT hitting the cap:
+        # then the whole backlog above `newest` really is indexed. While capped, leave
+        # the cursor so the next pass walks from the top, skips the done ones, continues.
+        if not capped and newest and newest != since:
             db.execute("INSERT OR REPLACE INTO sync_state(k, v) VALUES ('updated_since', ?)",
                        (newest,))
             db.commit()
     finally:
         db.close()
-    return processed
+    print(f"[reader-mcp] sync: {processed} indexed, {skipped} up-to-date, {scanned} scanned"
+          + (" (capped — more backlog)" if capped else ""), flush=True)
+    return processed, capped
 
 
 async def sync_loop() -> None:
-    """Boot sync, then every SYNC_INTERVAL_SECS. Errors logged and retried next tick
-    so a Readeck/OpenAI blip never takes the query path down."""
+    """Boot sync, then repeat. While a pass is capped there's backlog left, so loop
+    again after a short pause to drain the initial backfill quickly; once caught up,
+    settle into SYNC_INTERVAL_SECS. Errors are logged and retried so a Readeck/OpenAI
+    blip never takes the query path down."""
     readeck = Readeck()
     while True:
+        capped = False
         try:
-            n = await sync_once(readeck)
-            print(f"[reader-mcp] sync: {n} bookmarks indexed", flush=True)
+            _, capped = await sync_once(readeck)
         except Exception as e:  # noqa: BLE001
             print(f"[reader-mcp] sync failed: {type(e).__name__}: {e}", flush=True)
-        await asyncio.sleep(config.SYNC_INTERVAL_SECS)
+        await asyncio.sleep(5 if capped else config.SYNC_INTERVAL_SECS)
 
 
 # -- read path (tools) -----------------------------------------------------------
