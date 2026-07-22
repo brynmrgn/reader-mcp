@@ -36,7 +36,8 @@ def init_db() -> None:
         "CREATE TABLE IF NOT EXISTS chunks ("
         "  rowid INTEGER PRIMARY KEY, bookmark_id TEXT, chunk_idx INTEGER,"
         "  text TEXT, kind TEXT, section TEXT,"
-        "  title TEXT, url TEXT, site_name TEXT, labels TEXT, date TEXT)"
+        "  title TEXT, url TEXT, site_name TEXT, labels TEXT,"
+        "  published TEXT, added TEXT, updated TEXT)"
     )
     db.execute("CREATE INDEX IF NOT EXISTS chunks_bm ON chunks(bookmark_id)")
     db.execute(
@@ -55,7 +56,7 @@ def init_db() -> None:
     db.close()
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 def _migrate(db: sqlite3.Connection) -> None:
@@ -70,6 +71,12 @@ def _migrate(db: sqlite3.Connection) -> None:
     per-chunk `kind`/`section` are new, so the old fixed-window chunks are stale: add
     the columns and wipe the index to force a full re-embed (the paced backfill drains
     it over the next passes).
+
+    v4 — three date columns + drop image-only chunks. Replace the single coalesced
+    `date` with explicit `published` / `added` (Readeck save date) / `updated`, so search
+    can range-filter on any of the three. Also wipe the index: the new chunker skips
+    image-only paragraphs, and only a full re-embed both applies it and back-fills the
+    new date columns.
     """
     row = db.execute("SELECT v FROM sync_state WHERE k='schema_version'").fetchone()
     ver = int(row["v"]) if row else 0
@@ -91,6 +98,17 @@ def _migrate(db: sqlite3.Connection) -> None:
         db.execute("DELETE FROM sync_state WHERE k='updated_since'")
         print("[reader-mcp] migration v3: re-indexing all bookmarks with "
               "structure-aware chunking (summary + highlights + sections)", flush=True)
+    if ver < 4:
+        cols = {r[1] for r in db.execute("PRAGMA table_info(chunks)")}
+        for col in ("published", "added", "updated"):
+            if col not in cols:
+                db.execute(f"ALTER TABLE chunks ADD COLUMN {col} TEXT")
+        db.execute("DELETE FROM vec_chunks")
+        db.execute("DELETE FROM chunks")
+        db.execute("DELETE FROM indexed_state")
+        db.execute("DELETE FROM sync_state WHERE k='updated_since'")
+        print("[reader-mcp] migration v4: re-indexing with published/added/updated "
+              "dates and image-only chunks dropped", flush=True)
     db.execute("INSERT OR REPLACE INTO sync_state(k, v) VALUES ('schema_version', ?)",
                (str(_SCHEMA_VERSION),))
 
@@ -111,10 +129,18 @@ def _pack(vec: list[float]) -> bytes:
 _FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.S)   # article.md YAML block
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n")
+_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")            # Markdown image ![alt](url)
 
 
 def _strip_frontmatter(md: str) -> str:
     return _FRONTMATTER_RE.sub("", md, count=1)
+
+
+def _has_prose(text: str) -> bool:
+    """True if `text` carries indexable prose once Markdown images are removed. Filters
+    out image-only paragraphs (e.g. `![](.../image.webp)`) that otherwise get embedded
+    and surface as empty `body` passages, diluting search results."""
+    return bool(re.search(r"\w", _IMAGE_RE.sub(" ", text)))
 
 
 def _split_sections(md: str) -> list[tuple[str, str]]:
@@ -152,6 +178,8 @@ def _pack_paragraphs(text: str, max_chars: int, overlap: int) -> list[str]:
     chunks: list[str] = []
     cur = ""
     for para in (p.strip() for p in _PARA_SPLIT_RE.split(text) if p.strip()):
+        if not _has_prose(para):
+            continue
         if len(para) > max_chars:
             if cur:
                 chunks.append(cur)
@@ -182,7 +210,7 @@ def _build_parts(bm: dict, markdown: str, highlights: list[str]) -> list[dict]:
     for section, sect_text in _split_sections(body):
         for piece in _pack_paragraphs(sect_text, config.CHUNK_CHARS, config.CHUNK_OVERLAP):
             parts.append({"text": piece, "kind": "body", "section": section or None})
-    if not parts:
+    if not parts and _has_prose(markdown or ""):
         parts.append({"text": (markdown or "").strip(), "kind": "body", "section": None})
     return parts
 
@@ -214,13 +242,17 @@ def _replace_bookmark(db: sqlite3.Connection, bm: dict, parts: list[dict],
         db.execute("DELETE FROM vec_chunks WHERE rowid=?", (rid,))
     db.execute("DELETE FROM chunks WHERE bookmark_id=?", (bid,))
     labels = json.dumps(bm.get("labels") or [])
-    date = bm.get("published") or bm.get("created")
+    published = bm.get("published")   # article publish date (may be null)
+    added = bm.get("created")         # when the article was saved into Readeck
+    updated = bm.get("updated")       # last modification in Readeck
     for idx, (part, vec) in enumerate(zip(parts, vectors)):
         cur = db.execute(
             "INSERT INTO chunks(bookmark_id, chunk_idx, text, kind, section,"
-            " title, url, site_name, labels, date) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " title, url, site_name, labels, published, added, updated)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (bid, idx, part["text"], part["kind"], part.get("section"),
-             bm.get("title"), bm.get("url"), bm.get("site_name"), labels, date),
+             bm.get("title"), bm.get("url"), bm.get("site_name"), labels,
+             published, added, updated),
         )
         db.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES (?,?)",
                    (cur.lastrowid, _pack(vec)))
@@ -314,14 +346,33 @@ async def sync_loop() -> None:
 _KIND_BOOST = {"highlight": 0.06, "summary": 0.03}
 
 
+def _in_range(val: str | None, after: str | None, before: str | None) -> bool:
+    """Inclusive-`after`, exclusive-`before` ISO date/datetime comparison (lexical, which
+    is correct for ISO-8601). A null value fails any bound that is set."""
+    if after and (not val or val < after):
+        return False
+    if before and (not val or val >= before):
+        return False
+    return True
+
+
 async def search(q: str, limit: int = 8, label: str | None = None,
-                 site_name: str | None = None, since: str | None = None) -> list[dict]:
+                 site_name: str | None = None,
+                 published_after: str | None = None, published_before: str | None = None,
+                 added_after: str | None = None, added_before: str | None = None,
+                 updated_after: str | None = None, updated_before: str | None = None) -> list[dict]:
     """Semantic search: embed query, KNN over chunk vectors, apply optional metadata
     filters, boost highlight/summary chunks, then collapse to distinct bookmarks (best
     chunk wins). Filters can't go inside the vec0 KNN (it needs the LIMIT directly), so
-    we over-fetch a larger candidate set and filter/rank in Python."""
+    we over-fetch a larger candidate set and filter/rank in Python.
+
+    Three independent date dimensions, each with an inclusive `_after` and exclusive
+    `_before` bound (ISO date/datetime): `published_*` (article publish date), `added_*`
+    (when it was saved to the library) and `updated_*` (last modified in Readeck)."""
+    dates_set = any((published_after, published_before, added_after, added_before,
+                     updated_after, updated_before))
     (qvec,) = await _embed([q])
-    filtered = bool(label or site_name or since)
+    filtered = bool(label or site_name or dates_set)
     k = max(limit * 25, 300) if filtered else max(limit * 4, limit)
     db = _connect()
     try:
@@ -331,7 +382,7 @@ async def search(q: str, limit: int = 8, label: str | None = None,
             "  WHERE embedding MATCH ? ORDER BY distance LIMIT ?"
             ")"
             " SELECT c.bookmark_id, c.text, c.kind, c.section, c.title, c.url,"
-            " c.site_name, c.labels, c.date, knn.distance"
+            " c.site_name, c.labels, c.published, c.added, c.updated, knn.distance"
             " FROM knn JOIN chunks c ON c.rowid = knn.rowid"
             " ORDER BY knn.distance",
             (_pack(qvec), k),
@@ -346,7 +397,11 @@ async def search(q: str, limit: int = 8, label: str | None = None,
             continue
         if site_l and (r["site_name"] or "").lower() != site_l:
             continue
-        if since and (not r["date"] or r["date"] < since):
+        if not _in_range(r["published"], published_after, published_before):
+            continue
+        if not _in_range(r["added"], added_after, added_before):
+            continue
+        if not _in_range(r["updated"], updated_after, updated_before):
             continue
         score = (1 - r["distance"]) + _KIND_BOOST.get(r["kind"], 0.0)
         scored.append((score, r, lbls))
@@ -366,7 +421,9 @@ async def search(q: str, limit: int = 8, label: str | None = None,
             "kind": r["kind"],
             "section": r["section"],
             "labels": lbls,
-            "date": r["date"],
+            "published": r["published"],
+            "added": r["added"],
+            "updated": r["updated"],
             "score": round(score, 4),
         })
         if len(out) >= limit:
@@ -380,8 +437,9 @@ async def get_source(bookmark_id: str) -> dict:
     db = _connect()
     try:
         rows = db.execute(
-            "SELECT text, kind, section, title, url, site_name, labels, date FROM chunks"
-            " WHERE bookmark_id=? ORDER BY chunk_idx", (str(bookmark_id),),
+            "SELECT text, kind, section, title, url, site_name, labels,"
+            " published, added, updated"
+            " FROM chunks WHERE bookmark_id=? ORDER BY chunk_idx", (str(bookmark_id),),
         ).fetchall()
     finally:
         db.close()
@@ -394,7 +452,10 @@ async def get_source(bookmark_id: str) -> dict:
         "id": str(bookmark_id),
         "uri": rows[0]["url"], "title": rows[0]["title"],
         "site_name": rows[0]["site_name"],
-        "labels": json.loads(rows[0]["labels"] or "[]"), "date": rows[0]["date"],
+        "labels": json.loads(rows[0]["labels"] or "[]"),
+        "published": rows[0]["published"],
+        "added": rows[0]["added"],
+        "updated": rows[0]["updated"],
         "summary": summary,
         "highlights": highlights,
         "text": body or " ".join(r["text"] for r in rows),

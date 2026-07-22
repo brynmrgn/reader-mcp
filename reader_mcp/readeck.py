@@ -47,6 +47,31 @@ class Readeck:
                     return
                 offset += limit
 
+    async def search_bookmarks(self, filters: dict, limit: int = 15) -> tuple[list[dict], int]:
+        """Server-side bookmark search/filter via GET /api/bookmarks query params.
+
+        Unlike bookmarks() (which pages everything for the sync loop), this passes the
+        caller's filters straight to Readeck's own full-text + metadata search and returns
+        a single bounded page plus the Total-Count. `filters` keys are Readeck param names
+        (search, title, author, site, labels, type, is_marked, is_archived, read_status,
+        range_start, range_end, sort, ...); None/empty values are dropped.
+
+        Confirmed against this instance's OpenAPI: the list endpoint accepts these params
+        and returns a bare JSON array with a `Total-Count` header (total across all pages).
+        """
+        params = {}
+        for k, v in filters.items():
+            if v in (None, "", []):
+                continue
+            # Readeck expects lowercase true/false, not Python's "True"/"False".
+            params[k] = "true" if v is True else "false" if v is False else v
+        params["limit"] = limit
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await self._get(client, "/api/bookmarks", **params)
+            items = r.json() or []
+            total = int(r.headers.get("Total-Count", len(items)))
+        return items, total
+
     async def article_markdown(self, bookmark_id: str) -> str:
         """Extracted readable text as Markdown.
 
