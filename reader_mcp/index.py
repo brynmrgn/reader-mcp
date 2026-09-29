@@ -12,6 +12,7 @@ import re
 import sqlite3
 import struct
 
+import httpx
 import sqlite_vec
 from openai import AsyncOpenAI
 
@@ -234,13 +235,17 @@ async def _embed(texts: list[str]) -> list[list[float]]:
 
 # -- write path (sync) -----------------------------------------------------------
 
-def _replace_bookmark(db: sqlite3.Connection, bm: dict, parts: list[dict],
-                      vectors: list[list[float]]) -> None:
-    bid = str(bm.get("id"))
+def _delete_bookmark(db: sqlite3.Connection, bid: str) -> None:
     old = [r["rowid"] for r in db.execute("SELECT rowid FROM chunks WHERE bookmark_id=?", (bid,))]
     for rid in old:
         db.execute("DELETE FROM vec_chunks WHERE rowid=?", (rid,))
     db.execute("DELETE FROM chunks WHERE bookmark_id=?", (bid,))
+
+
+def _replace_bookmark(db: sqlite3.Connection, bm: dict, parts: list[dict],
+                      vectors: list[list[float]]) -> None:
+    bid = str(bm.get("id"))
+    _delete_bookmark(db, bid)
     labels = json.dumps(bm.get("labels") or [])
     published = bm.get("published")   # article publish date (may be null)
     added = bm.get("created")         # when the article was saved into Readeck
@@ -259,41 +264,61 @@ def _replace_bookmark(db: sqlite3.Connection, bm: dict, parts: list[dict],
 
 
 async def sync_once(readeck: Readeck) -> tuple[int, bool]:
-    """Index up to SYNC_MAX_PER_PASS not-yet-current bookmarks, newest→oldest.
+    """Index up to SYNC_MAX_PER_PASS not-yet-current bookmarks, newest→oldest, and
+    drop deleted ones from the index.
 
-    Only article-bearing, loaded, non-deleted bookmarks. Returns (processed, capped),
-    where `capped` means the pass stopped at the cap and there is more backlog to do.
+    Only article-bearing, loaded, non-deleted bookmarks are indexed. Returns
+    (processed, capped), where `capped` means the pass stopped at the cap and there
+    is more backlog to do.
 
+    Change detection uses Readeck's sync list (GET /api/bookmarks/sync?since=), which
+    returns every bookmark id changed at/after the cursor with its update time.
     Two cursors work together so the cap and incremental catch-up don't fight:
       * `indexed_state[bid]` — the `updated` we last embedded per bookmark. A pass
         walks newest→oldest and SKIPS anything already current, so successive capped
         passes march down the backlog instead of re-embedding the newest N each time.
-      * `updated_since` — a high-water mark, advanced ONLY after a non-capped pass
-        (i.e. the whole backlog above it is indexed). Then later passes can early-break
-        once they reach items at/older than it. It stays unset while backfilling.
+      * `updated_since` — a high-water mark passed as `since`, advanced ONLY after a
+        non-capped pass (i.e. the whole backlog up to it is indexed). It stays at its
+        old value while backfilling, so the next pass re-lists the same backlog.
     """
     db = _connect()
     row = db.execute("SELECT v FROM sync_state WHERE k='updated_since'").fetchone()
     since = row["v"] if row else None
     indexed = dict(db.execute("SELECT bookmark_id, updated FROM indexed_state").fetchall())
-    processed = skipped = scanned = 0
-    newest, capped = since, False
+    processed = skipped = deleted = 0
+    capped = False
+    changes: list[dict] = []
     try:
-        async for bm in readeck.bookmarks():
-            scanned += 1
-            upd = bm.get("updated")
-            if upd and (newest is None or upd > newest):
-                newest = upd
-            # Steady state: a cursor exists only after a non-capped pass, so everything
-            # at/older than it is fully indexed -> stop (listing is newest-first).
-            if since and upd and upd <= since:
-                break
-            if not (bm.get("state") == 0 and bm.get("has_article") and not bm.get("is_deleted")):
+        changes = await readeck.sync_list(since)
+        changes.sort(key=lambda c: c.get("time") or "", reverse=True)   # newest first
+        newest = max((c["time"] for c in changes if c.get("time")), default=since)
+        for ch in changes:
+            bid = str(ch.get("id"))
+            if ch.get("type") == "delete":
+                if bid in indexed:
+                    _delete_bookmark(db, bid)
+                    db.execute("DELETE FROM indexed_state WHERE bookmark_id=?", (bid,))
+                    db.commit()
+                    del indexed[bid]
+                    deleted += 1
                 continue
-            bid = str(bm.get("id"))
             # Already current? (NULL = legacy row, treat as current so backfill advances.)
-            if bid in indexed and (indexed[bid] is None or indexed[bid] == upd):
+            # The sync list's `time` is the bookmark's `updated`; if the two ever differ
+            # in format, the bookmark fetch below still catches an unchanged bookmark.
+            if bid in indexed and (indexed[bid] is None or indexed[bid] == ch.get("time")):
                 skipped += 1
+                continue
+            try:
+                bm = await readeck.bookmark(bid)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:   # deleted between list and fetch
+                    continue
+                raise
+            upd = bm.get("updated")
+            if bid in indexed and indexed[bid] == upd:
+                skipped += 1
+                continue
+            if not (bm.get("state") == 0 and bm.get("has_article") and not bm.get("is_deleted")):
                 continue
             text = await readeck.article_markdown(bid)
             if not text:
@@ -311,15 +336,16 @@ async def sync_once(readeck: Readeck) -> tuple[int, bool]:
                 capped = True
                 break
         # Only claim the high-water mark once a pass finished WITHOUT hitting the cap:
-        # then the whole backlog above `newest` really is indexed. While capped, leave
-        # the cursor so the next pass walks from the top, skips the done ones, continues.
+        # then everything changed up to `newest` really is indexed. While capped, leave
+        # the cursor so the next pass re-lists the backlog, skips the done ones, continues.
         if not capped and newest and newest != since:
             db.execute("INSERT OR REPLACE INTO sync_state(k, v) VALUES ('updated_since', ?)",
                        (newest,))
             db.commit()
     finally:
         db.close()
-    print(f"[reader-mcp] sync: {processed} indexed, {skipped} up-to-date, {scanned} scanned"
+    print(f"[reader-mcp] sync: {processed} indexed, {skipped} up-to-date, {deleted} removed,"
+          f" {len(changes)} changes listed"
           + (" (capped — more backlog)" if capped else ""), flush=True)
     return processed, capped
 

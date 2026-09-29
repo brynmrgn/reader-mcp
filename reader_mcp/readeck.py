@@ -3,9 +3,8 @@
 Paths/fields below are CONFIRMED against this Readeck instance (tested live), not
 just the generic 0.20 docs. Differences from the library-sources original:
   - article is fetched as Markdown via /article.md (no HTML stripping needed)
-  - listing is a bare JSON array with offset/limit paging (no `updated_since`
-    param); incremental filtering is done by the caller against the `updated`
-    field, since this instance was not confirmed to support server-side since-filtering
+  - incremental sync uses /api/bookmarks/sync?since= (Readeck 0.23+), which lists
+    changed and deleted bookmark ids; metadata is then fetched per bookmark
   - labels come back as [{name, count, href, ...}]
 """
 from __future__ import annotations
@@ -25,32 +24,22 @@ class Readeck:
         r.raise_for_status()
         return r
 
-    async def bookmarks(self, limit: int = 50):
-        """Yield bookmark dicts, newest-updated first, paging until exhausted.
+    async def sync_list(self, since: str | None = None) -> list[dict]:
+        """Every bookmark changed at/after `since` (all of them if None), as
+        [{id, time, type}] where type is "update" or "delete".
 
-        Confirmed: GET /api/bookmarks returns a bare JSON array; offset/limit paging
-        works; each bookmark carries id, url, title, site_name, authors[], labels[],
-        published, created, updated, state, has_article, is_deleted, description.
-        Incremental behaviour is the caller's job (compare `updated` to its cursor).
+        GET /api/bookmarks/sync (Readeck >= 0.23; non-paginated). Replaces paging
+        /api/bookmarks with sort=-updated, which 0.23 rejects with a 422. Unlike the
+        list endpoint it also reports deletions.
         """
-        async with httpx.AsyncClient(timeout=30) as client:
-            offset = 0
-            while True:
-                r = await self._get(client, "/api/bookmarks",
-                                    limit=limit, offset=offset, sort="-updated")
-                items = r.json()
-                if not items:
-                    return
-                for it in items:
-                    yield it
-                if len(items) < limit:
-                    return
-                offset += limit
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await self._get(client, "/api/bookmarks/sync", since=since)
+            return r.json() or []
 
     async def search_bookmarks(self, filters: dict, limit: int = 15) -> tuple[list[dict], int]:
         """Server-side bookmark search/filter via GET /api/bookmarks query params.
 
-        Unlike bookmarks() (which pages everything for the sync loop), this passes the
+        Unlike sync_list() (which feeds the sync loop), this passes the
         caller's filters straight to Readeck's own full-text + metadata search and returns
         a single bounded page plus the Total-Count. `filters` keys are Readeck param names
         (search, title, author, site, labels, type, is_marked, is_archived, read_status,
