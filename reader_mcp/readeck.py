@@ -72,6 +72,15 @@ class Readeck:
             total = int(r.headers.get("Total-Count", len(items)))
         return items, total
 
+    async def bookmark(self, bookmark_id: str) -> dict:
+        """Metadata for one bookmark (same shape as a /api/bookmarks list item).
+
+        GET /api/bookmarks/{id}; raises httpx.HTTPStatusError (404) for an unknown id.
+        """
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await self._get(client, f"/api/bookmarks/{bookmark_id}")
+            return r.json()
+
     async def article_markdown(self, bookmark_id: str) -> str:
         """Extracted readable text as Markdown.
 

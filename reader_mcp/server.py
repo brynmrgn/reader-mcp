@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import threading
 
+import httpx
 from fastmcp import FastMCP
 
 from . import config, index
@@ -110,9 +111,40 @@ async def find_articles(query: str | None = None, title: str | None = None,
 
 @mcp.tool()
 async def get_article(id: str) -> dict:
-    """Read one saved article in full (all text + metadata) by its id -- use after
-    search_articles when you need the surrounding detail or full argument."""
-    return await index.get_source(id)
+    """Read one saved article in full: the complete text as Markdown (headings,
+    paragraphs and lists intact) plus its metadata, `summary` and user `highlights`.
+    Fetched live from Readeck, so it works for articles saved moments ago, before
+    they reach the search index. Use after search_articles / find_articles when you
+    need the full argument or surrounding detail.
+
+    `id` is the bookmark id returned by the other tools -- also the last path segment
+    of a `reader.brynmrgn.com/bookmarks/{id}` link."""
+    rd = Readeck()
+    try:
+        bm, md, highlights = await asyncio.gather(
+            rd.bookmark(id), rd.article_markdown(id), rd.annotations(id))
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return {"error": f"No bookmark with id {id!r} in the reading library."}
+        raise
+    except httpx.TransportError:
+        # Readeck unreachable: fall back to the text rebuilt from the search index.
+        src = await index.get_source(id)
+        if not src:
+            return {"error": f"Readeck is unreachable and bookmark {id!r} is not in the search index."}
+        src["note"] = ("Readeck was unreachable, so this text was rebuilt from the search "
+                       "index: structure is flattened and passages may repeat at chunk "
+                       "boundaries.")
+        return src
+
+    out = _fmt_bookmark(bm)
+    # The index's `summary` is the bookmark description, so take it live rather than stale.
+    out["summary"] = out.pop("description") or None
+    out["highlights"] = highlights
+    out["text"] = index._strip_frontmatter(md).strip()
+    if not bm.get("has_article"):
+        out["note"] = "Readeck has no extracted article text for this bookmark."
+    return out
 
 
 @mcp.tool()
