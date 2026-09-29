@@ -6,6 +6,7 @@ proven library-sources pattern.
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 
 import httpx
@@ -15,6 +16,16 @@ from . import config, index
 from .readeck import Readeck
 
 mcp = FastMCP("reader-mcp")
+
+# Markdown image ![alt](url "title"). Readeck points these at its internal base URL
+# (localhost), and the public hostname sits behind Cloudflare Access, so the links are
+# unreachable to any caller -- keep only the alt text.
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+
+
+def _image_to_alt(m: re.Match) -> str:
+    alt = m.group(1).strip()
+    return f"[Image: {alt}]" if alt else ""
 
 
 @mcp.tool()
@@ -141,7 +152,7 @@ async def get_article(id: str) -> dict:
     # The index's `summary` is the bookmark description, so take it live rather than stale.
     out["summary"] = out.pop("description") or None
     out["highlights"] = highlights
-    out["text"] = index._strip_frontmatter(md).strip()
+    out["text"] = _IMAGE_RE.sub(_image_to_alt, index._strip_frontmatter(md)).strip()
     if not bm.get("has_article"):
         out["note"] = "Readeck has no extracted article text for this bookmark."
     return out
